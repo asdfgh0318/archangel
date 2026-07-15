@@ -6,27 +6,25 @@ Depends on: PyQt6, PyMuPDF, piper-tts (already in venv). Voices in ~/.local/pipe
 """
 from __future__ import annotations
 
-import glob
-import os
 import re
-import subprocess
 import sys
 import tempfile
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
 import fitz  # PyMuPDF
-from PyQt6.QtCore import (QRectF, Qt, QUrl, pyqtSignal)
+from piper import PiperVoice, SynthesisConfig
+from PyQt6.QtCore import (QObject, QRectF, Qt, QThread, QUrl, pyqtSignal)
 from PyQt6.QtGui import (QAction, QBrush, QColor, QImage, QPainter, QPen, QPixmap)
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QApplication, QComboBox, QDoubleSpinBox, QFileDialog,
     QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView,
-    QGroupBox, QHBoxLayout, QLabel, QMainWindow, QPushButton, QScrollArea,
+    QGroupBox, QHBoxLayout, QLabel, QMainWindow, QPushButton,
     QSlider, QSpinBox, QSplitter, QStatusBar, QVBoxLayout, QWidget,
 )
 
-PIPER_BIN = str(Path.home() / ".local/piper/venv/bin/piper")
 VOICES_DIR = Path.home() / ".local/piper/voices"
 RENDER_ZOOM = 1.6
 
@@ -64,31 +62,9 @@ class PdfScene(QGraphicsScene):
         self._word_rects: list[tuple[QRectF, int]] = []  # (rect on scene, word idx)
         self._zoom = RENDER_ZOOM
 
-    def show_page(self, page: fitz.Page, words: list[WordBox], page_start_word: int):
-        self.clear()
-        self._highlight_items.clear()
-        self._word_rects.clear()
-        # render at zoom
-        mat = fitz.Matrix(self._zoom, self._zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = QImage(pix.samples, pix.width, pix.height, pix.stride,
-                     QImage.Format.Format_RGB888)
-        pm = QPixmap.fromImage(img.copy())  # copy to detach from pix buffer
-        self._pixmap_item = self.addPixmap(pm)
-        self._pixmap_item.setZValue(0)
-        self.setSceneRect(0, 0, pm.width(), pm.height())
-        # store word rects (in scene coords) for hit-testing
-        for gi, w in enumerate(words):
-            if w.page != page.number:
-                continue
-            r = QRectF(w.x0 * self._zoom, w.y0 * self._zoom,
-                       (w.x1 - w.x0) * self._zoom, (w.y1 - w.y0) * self._zoom)
-            self._word_rects.append((r, page_start_word + [pw for pw in words[:gi]
-                                                            if pw.page == page.number].__len__()))
-        # NB: page_start_word arithmetic is done outside now — see MainWindow
-
-    def show_page_v2(self, page: fitz.Page, page_words: list[tuple[WordBox, int]]):
-        """Cleaner variant: caller passes (WordBox, global_index) pairs already filtered."""
+    def show_page(self, page: fitz.Page, page_words: list[tuple[WordBox, int]]):
+        """Render a page. Caller passes (WordBox, global_index) pairs already
+        filtered to this page."""
         self.clear()
         self._highlight_items.clear()
         self._word_rects.clear()
@@ -140,7 +116,54 @@ class Voices:
         return sorted(VOICES_DIR.glob("*.onnx"))
 
 
+class SynthWorker(QObject):
+    """Synthesizes sentences on a background thread using an in-process
+    PiperVoice. The voice model is loaded once and reused, which is the
+    whole point: spawning the piper CLI per sentence costs ~2.4 s of model
+    loading every time, which is audible dead air between sentences."""
+    done = pyqtSignal(int, str)     # sentence index, wav path
+    failed = pyqtSignal(int, str)   # sentence index, error message
+    voice_loaded = pyqtSignal(str)  # voice name
+
+    def __init__(self, tempdir: str):
+        super().__init__()
+        self._voice: PiperVoice | None = None
+        self._voice_path: str | None = None
+        self._tempdir = tempdir
+
+    def ensure_voice(self, path: str):
+        """Load a voice if it isn't the one already loaded. Runs on the worker
+        thread; the ~2 s cost is paid once per voice, not once per sentence."""
+        if self._voice_path == path and self._voice is not None:
+            return
+        self._voice = PiperVoice.load(path)
+        self._voice_path = path
+        self.voice_loaded.emit(Path(path).name)
+
+    def synthesize(self, index: int, text: str, voice_path: str,
+                   length_scale: float, noise_scale: float, noise_w: float,
+                   sentence_silence: float, speaker_id: int | None):
+        try:
+            self.ensure_voice(voice_path)
+            cfg = SynthesisConfig(
+                length_scale=length_scale,
+                noise_scale=noise_scale,
+                noise_w_scale=noise_w,
+                speaker_id=speaker_id,
+            )
+            out = Path(self._tempdir) / f"s_{index}.wav"
+            with wave.open(str(out), "wb") as wf:
+                self._voice.synthesize_wav(text, wf, syn_config=cfg)
+            self.done.emit(index, str(out))
+        except Exception as e:  # noqa: BLE001 - surface any synth failure to the UI
+            self.failed.emit(index, str(e))
+
+
 class MainWindow(QMainWindow):
+    # index, text, voice_path, length_scale, noise_scale, noise_w,
+    # sentence_silence, speaker_id
+    synth_requested = pyqtSignal(int, str, str, float, float, float, float, object)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Archangel")
@@ -155,12 +178,29 @@ class MainWindow(QMainWindow):
         self.speakers: dict[str, int] = {}
         self._tempdir = tempfile.TemporaryDirectory(prefix="archangel_")
 
+        # synthesis state
+        self._wav_cache: dict[int, str] = {}   # sentence index -> wav path
+        self._pending: set[int] = set()        # sentence indices in flight
+        self._want_play = False                # play as soon as current arrives
+
         # audio
         self.player = QMediaPlayer(self)
         self.audio_out = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_out)
         self.player.mediaStatusChanged.connect(self._on_media_status)
         self.audio_out.setVolume(0.9)
+
+        # synthesis worker on its own thread — the voice model is loaded once
+        # there and reused, so sentences cost synthesis time only.
+        self._thread = QThread(self)
+        self._worker = SynthWorker(self._tempdir.name)
+        self._worker.moveToThread(self._thread)
+        self._worker.done.connect(self._on_synth_done)
+        self._worker.failed.connect(self._on_synth_failed)
+        self._worker.voice_loaded.connect(
+            lambda n: self.statusBar().showMessage(f"Voice loaded: {n}", 3000))
+        self.synth_requested.connect(self._worker.synthesize)
+        self._thread.start()
 
         self._build_ui()
         self._refresh_voice_list()
@@ -276,6 +316,12 @@ class MainWindow(QMainWindow):
         gl.addWidget(self.reset_knobs_btn)
         rv.addWidget(gb_knobs)
 
+        # Changing any knob makes already-rendered audio stale.
+        for knob in (self.speed, self.noise_scale, self.noise_w,
+                     self.sentence_silence):
+            knob.valueChanged.connect(self._invalidate_cache)
+        self.speaker_spin.valueChanged.connect(self._invalidate_cache)
+
         # audio out
         gb_audio = QGroupBox("Audio")
         ga = QVBoxLayout(gb_audio)
@@ -293,7 +339,7 @@ class MainWindow(QMainWindow):
 
         # about the voices dir
         info = QLabel(f"<small>Voices dir: <code>{VOICES_DIR}</code><br>"
-                      f"Piper: <code>{PIPER_BIN}</code></small>")
+                      "Synthesis: in-process Piper (model loaded once)</small>")
         info.setTextFormat(Qt.TextFormat.RichText)
         info.setWordWrap(True)
         info.setStyleSheet("color:#666;")
@@ -354,6 +400,7 @@ class MainWindow(QMainWindow):
         path = self.voice_combo.currentData()
         if not path:
             return
+        self._invalidate_cache()  # different voice, different audio
         # Multi-speaker check via .onnx.json
         try:
             import json
@@ -438,7 +485,7 @@ class MainWindow(QMainWindow):
         page = self.doc[self.current_page]
         # scene wants (WordBox, global_idx) filtered to this page
         page_pairs = [(w, i) for i, w in enumerate(self.words) if w.page == self.current_page]
-        self.scene.show_page_v2(page, page_pairs)
+        self.scene.show_page(page, page_pairs)
         self._render_highlight()
         self.page_spin.blockSignals(True)
         self.page_spin.setValue(self.current_page + 1)
@@ -522,49 +569,66 @@ class MainWindow(QMainWindow):
             self.current_page = pg
             self._render_current_page()
 
-    def _synthesize_sentence(self, text: str) -> Path | None:
+    def _request_synth(self, index: int):
+        """Ask the worker thread to synthesize a sentence. Non-blocking."""
+        if index < 0 or index >= len(self.sentences):
+            return
+        if index in self._wav_cache or index in self._pending:
+            return
         voice = self.voice_combo.currentData()
         if not voice:
             self.statusBar().showMessage("No voice model selected.")
-            return None
-        wav_path = Path(self._tempdir.name) / f"s_{self.current_sentence}.wav"
-        cmd = [
-            PIPER_BIN, "--model", voice,
-            "--length_scale", str(self.speed.value()),
-            "--noise_scale", str(self.noise_scale.value()),
-            "--noise_w", str(self.noise_w.value()),
-            "--sentence_silence", str(self.sentence_silence.value()),
-            "--output_file", str(wav_path),
-        ]
-        if self.speaker_spin.isEnabled():
-            cmd.extend(["--speaker", str(self.speaker_spin.value())])
-        try:
-            proc = subprocess.run(cmd, input=text.encode("utf-8"),
-                                  capture_output=True, timeout=120)
-            if proc.returncode != 0:
-                self.statusBar().showMessage(f"Piper failed: {proc.stderr[:100].decode(errors='replace')}")
-                return None
-        except Exception as e:
-            self.statusBar().showMessage(f"Synthesis error: {e}")
-            return None
-        return wav_path
+            return
+        self._pending.add(index)
+        self.synth_requested.emit(
+            index, self.sentences[index].text, voice,
+            self.speed.value(), self.noise_scale.value(), self.noise_w.value(),
+            self.sentence_silence.value(),
+            self.speaker_spin.value() if self.speaker_spin.isEnabled() else None,
+        )
+
+    def _invalidate_cache(self):
+        """Synthesis knobs changed — previously rendered audio is stale."""
+        self._wav_cache.clear()
+
+    def _on_synth_done(self, index: int, wav_path: str):
+        self._pending.discard(index)
+        self._wav_cache[index] = wav_path
+        # If we're waiting on this one, play it now.
+        if self._want_play and index == self.current_sentence:
+            self._want_play = False
+            self._start_wav(wav_path)
+            self._request_synth(index + 1)  # prefetch next while this plays
+
+    def _on_synth_failed(self, index: int, err: str):
+        self._pending.discard(index)
+        self.statusBar().showMessage(f"Synthesis failed on sentence {index}: {err}")
+        if self._want_play and index == self.current_sentence:
+            self._want_play = False
+            self.play_btn.setText("▶ Play")
+
+    def _start_wav(self, wav_path: str):
+        self.player.stop()
+        self.player.setSource(QUrl.fromLocalFile(wav_path))
+        self.player.play()
+        self.play_btn.setText("⏸ Pause")
 
     def _play_current_sentence(self):
         if self.current_sentence < 0 or self.current_sentence >= len(self.sentences):
             return
-        s = self.sentences[self.current_sentence]
         self._render_highlight()
-        wav = self._synthesize_sentence(s.text)
-        if not wav:
-            return
-        self.player.stop()
-        self.player.setSource(QUrl.fromLocalFile(str(wav)))
-        self.player.play()
-        self.play_btn.setText("⏸ Pause")
+        idx = self.current_sentence
+        cached = self._wav_cache.get(idx)
+        if cached:
+            self._start_wav(cached)
+            self._request_synth(idx + 1)  # prefetch next
+        else:
+            self._want_play = True
+            self.play_btn.setText("… synthesizing")
+            self._request_synth(idx)
 
     def _on_media_status(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            # advance
             if self.current_sentence + 1 < len(self.sentences):
                 self.current_sentence += 1
                 self._maybe_flip_page_to(self.current_sentence)
@@ -572,6 +636,12 @@ class MainWindow(QMainWindow):
             else:
                 self.play_btn.setText("▶ Play")
                 self.statusBar().showMessage("End of document.")
+
+    def closeEvent(self, event):
+        self.player.stop()
+        self._thread.quit()
+        self._thread.wait(3000)
+        super().closeEvent(event)
 
 
 def main():

@@ -19,6 +19,26 @@ speech, PyMuPDF for the PDF layer, and PyQt6 for the GUI.
   noise scale, phoneme-duration variation (`noise_w`), sentence silence,
   speaker id for multi-speaker models.
 - Zoom, page navigation, volume.
+- **Synthesis runs in-process on a worker thread**, with the voice model
+  loaded once and the next sentence prefetched while the current one plays.
+  The GUI never blocks.
+
+## Performance
+
+Measured on the primer PDF (8 pages, 4.6k words, 287 sentences),
+`en_GB-alan-medium`, CPU only:
+
+| | Time |
+|---|---|
+| Voice model load (once, at first play) | ~3 s |
+| Synthesis per sentence thereafter | ~0.3–0.9 s |
+
+Because the next sentence is synthesized while the current one is playing,
+the gap between sentences is normally inaudible.
+
+> An earlier version of this app spawned the `piper` CLI once per sentence,
+> which reloaded the 63 MB model every time and cost ~2.4 s of dead air
+> between sentences. If you fork from that revision, this is the thing to fix.
 
 ## Install
 
@@ -77,20 +97,24 @@ VOICES_DIR = Path.home() / ".local/piper/voices"
 
 ## Limits
 
-- **Sentence-level highlighting**, not word-by-word. Piper doesn't expose
-  phoneme-alignment timing in its CLI, so per-word karaoke would require
-  either forced alignment (heavier) or linear time division (approximate).
-  Sentence-level is honest and works reliably.
-- **Startup cost per sentence**: ~150–300 ms while Piper loads the model
-  each call. For a smoother experience, a future version can keep a
-  long-running Piper subprocess and stream sentences to it.
+- **Sentence-level highlighting**, not word-by-word — for now. Piper's
+  Python API does expose `synthesize(..., include_alignments=True)`
+  returning per-phoneme timing, so word-level karaoke is a real
+  possibility rather than a research problem; it simply isn't wired up
+  yet. See the roadmap.
+- **Sentence→word mapping is O(n²)** at load time. Fine for papers
+  (287 sentences load instantly); a 200k-word book would stall. Needs an
+  interval index before Archangel is pointed at long documents.
 - **PDF quality**: text extraction depends on the PDF having a real text
   layer. Scanned PDFs need OCR first (e.g. `ocrmypdf`).
+- **Rotated pages** are not handled in the click-to-position hit test.
+- Synthesized WAVs accumulate in a temp directory for the session; they're
+  cleaned up on exit, not pruned as you go.
 
 ## Roadmap
 
-- Long-running Piper subprocess for lower latency
-- Per-word timing via forced alignment (aeneas or Whisper)
+- Word-level karaoke highlighting via `synthesize(include_alignments=True)`
+- Interval index for sentence→word mapping (unblocks book-length PDFs)
 - Configurable highlight colour and shape
 - Bookmarks and reading position memory
 - Export selected pages to WAV/MP3
