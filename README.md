@@ -102,14 +102,24 @@ VOICES_DIR = Path.home() / ".local/piper/voices"
   returning per-phoneme timing, so word-level karaoke is a real
   possibility rather than a research problem; it simply isn't wired up
   yet. See the roadmap.
-- **Sentence→word mapping is O(n²)** at load time. Fine for papers
-  (287 sentences load instantly); a 200k-word book would stall. Needs an
-  interval index before Archangel is pointed at long documents.
 - **PDF quality**: text extraction depends on the PDF having a real text
   layer. Scanned PDFs need OCR first (e.g. `ocrmypdf`).
 - **Rotated pages** are not handled in the click-to-position hit test.
 - Synthesized WAVs accumulate in a temp directory for the session; they're
   cleaned up on exit, not pruned as you go.
+- Sentence splitting leans on PyMuPDF's block structure, which is reliable
+  for ordinary prose PDFs. Multi-column layouts, tables, and figure
+  captions may still group oddly.
+
+## Controls
+
+| | |
+|---|---|
+| **Space** | Play / pause |
+| **Shift + →** | Next sentence |
+| **Shift + ←** | Previous sentence |
+| **Click a word** | Read from that sentence |
+| Hover a word | Faint underline preview; word shown in the status bar |
 
 ## Roadmap
 
