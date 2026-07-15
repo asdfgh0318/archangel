@@ -16,11 +16,12 @@ from pathlib import Path
 import fitz  # PyMuPDF
 from piper import PiperVoice, SynthesisConfig
 from PyQt6.QtCore import (QObject, QRectF, Qt, QThread, QUrl, pyqtSignal)
-from PyQt6.QtGui import (QAction, QBrush, QColor, QImage, QPainter, QPen, QPixmap)
+from PyQt6.QtGui import (QAction, QColor, QCursor, QImage, QKeySequence, QPainter,
+                         QPen, QPixmap, QShortcut)
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDoubleSpinBox, QFileDialog,
-    QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene, QGraphicsView,
+    QGraphicsLineItem, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView,
     QGroupBox, QHBoxLayout, QLabel, QMainWindow, QPushButton,
     QSlider, QSpinBox, QSplitter, QStatusBar, QVBoxLayout, QWidget,
 )
@@ -51,15 +52,27 @@ class Sentence:
 
 
 class PdfScene(QGraphicsScene):
-    """Displays one PDF page + a highlight overlay for the current sentence.
-    Emits a signal when a word is clicked."""
-    word_clicked = pyqtSignal(int)  # word global index
+    """Displays one PDF page and underlines the words being read.
+
+    Each word gets its OWN underline rather than one bar spanning the phrase,
+    so the marks follow word boundaries and break across line ends naturally.
+    Hovering a word previews it with a fainter underline; clicking one emits
+    its index."""
+    word_clicked = pyqtSignal(int)   # word global index
+    word_hovered = pyqtSignal(int)   # -1 when the cursor is over no word
+
+    UNDERLINE_COLOR = QColor(220, 60, 40)      # read-along mark
+    HOVER_COLOR = QColor(120, 120, 120)        # hover preview
+    UNDERLINE_WIDTH = 2.0
+    UNDERLINE_DROP = 1.0                       # px below the glyph box
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmap_item: QGraphicsPixmapItem | None = None
-        self._highlight_items: list[QGraphicsRectItem] = []
+        self._highlight_items: list[QGraphicsLineItem] = []
+        self._hover_item: QGraphicsLineItem | None = None
         self._word_rects: list[tuple[QRectF, int]] = []  # (rect on scene, word idx)
+        self._hover_idx: int = -1
         self._zoom = RENDER_ZOOM
 
     def show_page(self, page: fitz.Page, page_words: list[tuple[WordBox, int]]):
@@ -67,6 +80,8 @@ class PdfScene(QGraphicsScene):
         filtered to this page."""
         self.clear()
         self._highlight_items.clear()
+        self._hover_item = None
+        self._hover_idx = -1
         self._word_rects.clear()
         mat = fitz.Matrix(self._zoom, self._zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -81,28 +96,61 @@ class PdfScene(QGraphicsScene):
                        (w.x1 - w.x0) * self._zoom, (w.y1 - w.y0) * self._zoom)
             self._word_rects.append((r, gi))
 
+    def _underline_for(self, rect: QRectF, color: QColor,
+                       width: float) -> QGraphicsLineItem:
+        y = rect.bottom() + self.UNDERLINE_DROP
+        item = QGraphicsLineItem(rect.left(), y, rect.right(), y)
+        pen = QPen(color)
+        pen.setWidthF(width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        item.setPen(pen)
+        item.setZValue(2)
+        return item
+
     def highlight_words(self, global_indices: set[int]):
         for it in self._highlight_items:
             self.removeItem(it)
         self._highlight_items.clear()
-        pen = QPen(Qt.PenStyle.NoPen)
-        brush = QBrush(QColor(255, 235, 60, 110))  # translucent yellow
         for rect, gi in self._word_rects:
             if gi in global_indices:
-                pad = 1.5
-                item = QGraphicsRectItem(rect.adjusted(-pad, -pad, pad, pad))
-                item.setPen(pen)
-                item.setBrush(brush)
-                item.setZValue(1)
+                item = self._underline_for(rect, self.UNDERLINE_COLOR,
+                                           self.UNDERLINE_WIDTH)
                 self.addItem(item)
                 self._highlight_items.append(item)
 
-    def mousePressEvent(self, event):
-        p = event.scenePos()
+    def _set_hover(self, gi: int, rect: QRectF | None):
+        if gi == self._hover_idx:
+            return
+        self._hover_idx = gi
+        if self._hover_item is not None:
+            self.removeItem(self._hover_item)
+            self._hover_item = None
+        if rect is not None:
+            self._hover_item = self._underline_for(
+                rect, self.HOVER_COLOR, self.UNDERLINE_WIDTH * 0.75)
+            self._hover_item.setOpacity(0.65)
+            self.addItem(self._hover_item)
+        self.word_hovered.emit(gi)
+
+    def _word_at(self, p) -> tuple[QRectF, int] | None:
         for rect, gi in self._word_rects:
             if rect.contains(p):
-                self.word_clicked.emit(gi)
-                return
+                return rect, gi
+        return None
+
+    def mouseMoveEvent(self, event):
+        hit = self._word_at(event.scenePos())
+        if hit:
+            self._set_hover(hit[1], hit[0])
+        else:
+            self._set_hover(-1, None)
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        hit = self._word_at(event.scenePos())
+        if hit:
+            self.word_clicked.emit(hit[1])
+            return
         super().mousePressEvent(event)
 
     def set_zoom(self, z: float):
@@ -220,8 +268,15 @@ class MainWindow(QMainWindow):
 
         self.scene = PdfScene()
         self.scene.word_clicked.connect(self._on_word_clicked)
+        self.scene.word_hovered.connect(self._on_word_hovered)
         self.view = QGraphicsView(self.scene)
-        self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        # NoDrag, not ScrollHandDrag: the hand-drag mode replaces the pointer
+        # with a hand that only renders once a button is held, which reads as
+        # "no cursor" until you click. Scroll with the wheel and scrollbars.
+        self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.view.setMouseTracking(True)
+        self.view.viewport().setMouseTracking(True)
+        self.view.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         self.view.setRenderHints(
             QPainter.RenderHint.SmoothPixmapTransform |
             QPainter.RenderHint.Antialiasing)
@@ -362,6 +417,27 @@ class MainWindow(QMainWindow):
         act_quit.triggered.connect(self.close)
         f.addAction(act_quit)
 
+        self._build_shortcuts()
+
+    def _build_shortcuts(self):
+        """Keyboard transport. These are WindowShortcuts so they fire wherever
+        focus sits — including while a spin box in the sidebar has it. Space
+        would otherwise be swallowed by whichever button was last clicked."""
+        def add(seq, slot):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(slot)
+            return sc
+
+        add(Qt.Key.Key_Space, self._toggle_play)
+        add("Shift+Right", lambda: self._jump_sentence(+1))
+        add("Shift+Left", lambda: self._jump_sentence(-1))
+        # Buttons must not steal Space via their own focus/default handling.
+        for b in (self.play_btn, self.stop_btn, self.prev_btn, self.next_btn,
+                  self.open_btn, self.prev_page_btn, self.next_page_btn,
+                  self.reload_voices_btn, self.reset_knobs_btn):
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
     def _add_knob(self, layout, label, lo, hi, step, default, tip) -> QDoubleSpinBox:
         row = QHBoxLayout()
         lbl = QLabel(label)
@@ -439,45 +515,72 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Archangel — {Path(path).name}")
 
     def _extract_words_and_sentences(self):
+        """Build the word list and the sentence index.
+
+        PyMuPDF hands each word a (block, line) address, and a block is a
+        paragraph or a heading. Those boundaries are HARD sentence breaks:
+        a heading like "2 The Origin Story" carries no full stop, so
+        punctuation alone cannot separate it from the paragraph before or
+        after it, and the three run together. Splitting per block first fixes
+        that, and scoping the word search to a block also keeps this loop
+        linear rather than quadratic.
+        """
         self.words = []
+        self.sentences = []
         chunks: list[str] = []
         char_ptr = 0
+        # (char_start, char_end, first_word_idx, last_word_idx) per block
+        blocks: list[tuple[int, int, int, int]] = []
+        prev_key: tuple[int, int] | None = None
+        blk_char0 = 0
+        blk_widx0 = 0
+
         for pi, page in enumerate(self.doc):
-            page_words = page.get_text("words")  # x0 y0 x1 y1 w block line word
+            page_words = page.get_text("words")  # x0 y0 x1 y1 word block line n
             page_words.sort(key=lambda t: (t[5], t[6], t[7]))
-            for (x0, y0, x1, y1, w, blk, ln, wi) in page_words:
-                # append text with separators; we track exact char_start of each word
-                if chunks and not chunks[-1].endswith(("\n", " ")):
+            for (x0, y0, x1, y1, w, blk, ln, _wi) in page_words:
+                key = (pi, blk)
+                if prev_key is None:
+                    pass
+                elif key != prev_key:
+                    blocks.append((blk_char0, char_ptr, blk_widx0, len(self.words) - 1))
+                    chunks.append("\n\n")
+                    char_ptr += 2
+                    blk_char0 = char_ptr
+                    blk_widx0 = len(self.words)
+                else:
                     chunks.append(" ")
                     char_ptr += 1
+                prev_key = key
                 self.words.append(WordBox(
                     page=pi, x0=x0, y0=y0, x1=x1, y1=y1,
                     text=w, char_start=char_ptr))
                 chunks.append(w)
                 char_ptr += len(w)
-            if pi < len(self.doc) - 1:
-                chunks.append("\n\n")
-                char_ptr += 2
+        if prev_key is not None:
+            blocks.append((blk_char0, char_ptr, blk_widx0, len(self.words) - 1))
+
         self.text = "".join(chunks)
-        # sentence split — assign each sentence its word indices
-        self.sentences = []
-        # find sentence spans on the concatenated string
-        sent_texts = SENTENCE_SPLIT.split(self.text)
-        pos = 0
-        for st in sent_texts:
-            if not st.strip():
-                pos = self.text.find(st, pos) + len(st)
-                continue
-            start = self.text.find(st, pos)
-            end = start + len(st)
-            pos = end
-            # find word indices whose char_start ∈ [start, end)
-            widx = [i for i, w in enumerate(self.words)
-                    if start <= w.char_start < end]
-            if widx:
-                self.sentences.append(Sentence(text=st.strip(), word_indices=widx))
+
+        for (b0, b1, w0, w1) in blocks:
+            block_text = self.text[b0:b1]
+            pos = b0
+            for st in SENTENCE_SPLIT.split(block_text):
+                if not st.strip():
+                    continue
+                s0 = self.text.find(st, pos, b1)
+                if s0 < 0:
+                    continue
+                s1 = s0 + len(st)
+                pos = s1
+                widx = [i for i in range(w0, w1 + 1)
+                        if s0 <= self.words[i].char_start < s1]
+                if widx:
+                    self.sentences.append(Sentence(text=st.strip(), word_indices=widx))
+
         self.statusBar().showMessage(
-            f"{len(self.doc)} pages · {len(self.words)} words · {len(self.sentences)} sentences")
+            f"{len(self.doc)} pages · {len(self.words)} words · "
+            f"{len(self.sentences)} sentences · {len(blocks)} blocks")
 
     def _render_current_page(self):
         if not self.doc:
@@ -513,6 +616,17 @@ class MainWindow(QMainWindow):
     def _on_zoom(self, z: float):
         self.scene.set_zoom(z)
         self._render_current_page()
+
+    def _on_word_hovered(self, gi: int):
+        """Pointer feedback: I-beam over a word, arrow elsewhere, and the word
+        itself shown in the status bar."""
+        vp = self.view.viewport()
+        if gi < 0:
+            vp.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        vp.setCursor(Qt.CursorShape.IBeamCursor)
+        if 0 <= gi < len(self.words):
+            self.statusBar().showMessage(self.words[gi].text, 1500)
 
     def _on_word_clicked(self, gi: int):
         # find sentence containing this word
